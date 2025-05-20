@@ -1,0 +1,50 @@
+name: "Terraform Modules Downloader"
+description: "Downloads Terraform modules from S3 bucket and prepares them for use"
+inputs:
+  s3-bucket:
+    description: "S3 bucket containing the Terraform modules"
+    required: true
+  aws-region:
+    description: "AWS region"
+    required: true
+    default: "us-east-1"
+  destination-dir:
+    description: "Directory to download modules to"
+    required: false
+    default: "terraform_modules"
+  aws-role-arn:
+    description: "AWS IAM role ARN to assume"
+    required: true
+outputs:
+  modules-path:
+    description: "Path to the downloaded modules"
+    value: ${{ steps.setup-modules.outputs.modules_path }}
+runs:
+  using: "composite"
+  steps:
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.aws-role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Download and setup Terraform modules
+      id: setup-modules
+      shell: bash
+      run: |
+        # Execute the download script (found in workflows/scripts folder)
+        .github/workflows/scripts/download-modules.sh "${{ inputs.s3-bucket }}" "${{ inputs.destination-dir }}"
+
+        # Set output variable for future steps/jobs
+        echo "modules_path=${{ inputs.destination-dir }}" >> $GITHUB_OUTPUT
+
+        # List the downloaded modules
+        echo "Downloaded modules:"
+        ls -la ${{ inputs.destination-dir }}
+
+    - name: Upload modules as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-modules
+        path: ${{ steps.setup-modules.outputs.modules_path }}
+        retention-days: 1

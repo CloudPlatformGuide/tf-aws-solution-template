@@ -1,0 +1,103 @@
+name: Drift Detection
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+on:
+  schedule:
+    - cron: "0 12 * * 1" # Runs every Monday at 12:00 PM UTC | 7am EST
+  workflow_dispatch: # Allows manual triggering of the workflow
+    inputs:
+      region:
+        description: "AWS Region to deploy services"
+        type: string
+        default: "us-east-1"
+
+jobs:
+  prepare_modules:
+    name: Prepare Terraform Modules
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+      - name: Download S3 Terraform Modules
+        uses: ./.github/actions/download-modules
+        with:
+          s3-bucket: "tf-aws-rrm-modules"
+          aws-role-arn: "arn:aws:iam::${{ secrets.AWS_MODULE_ACCOUNT_ID }}:role/AWS-TF-GITHUB-ROLE"
+          aws-region: "us-east-1"
+          destination-dir: "terraform_modules"
+  drift-detection:
+    name: Detect Drift for ${{ matrix.account_code }}
+    needs: prepare_modules
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        account_code: [ESC_TEST] # List of account codes
+    env:
+      ACCOUNT_ID: ${{ secrets[matrix.account_code] }}
+      REGION: ${{ github.event.inputs.region || 'us-east-1'}}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Configure AWS Credentials (OIDC)
+        uses: ./.github/actions/aws-oidc-auth
+        with:
+          account_id: ${{ env.ACCOUNT_ID }}
+          region: ${{ env.REGION }}
+          role_name: RRMS-Cloud-MGMT
+      - name: Make TF State Script Executable
+        run: chmod +x .github/workflows/scripts/terraform-state.sh
+      - name: Create TF State
+        run: ./.github/workflows/scripts/terraform-state.sh terraform::create_state false "${{ env.ACCOUNT_ID}}-rrms-cloud-mgmt" "${{ env.ACCOUNT_ID}}-rrms-cloud-mgmt" ${{ env.REGION }} "RRMS-Cloud-MGMT" | tee /dev/stderr
+      - name: Download Terraform modules artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-modules
+          path: remote_modules
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+      - name: Terraform Init
+        run: |
+          eval `ssh-agent -s`
+          ssh-add - <<< '${{ secrets.MODULE_KEY }}'
+          mv state.config ./account_setup
+          cd ./account_setup
+          terraform init -backend-config="state.config"
+      - name: Detect Drift for ${{ matrix.account_code  }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          eval `ssh-agent -s`
+          ssh-add - <<< '${{ secrets.MODULE_KEY }}'
+          cd ./account_setup
+          varfile=./accounts/$(echo ${{ matrix.account_code }} | tr '[:upper:]' '[:lower:]').tfvars
+
+          DRIFT_OUTPUT=$(../.github/workflows/scripts/terraform-state.sh terraform::drift_detection "${varfile}")
+
+          echo "$DRIFT_OUTPUT"
+
+          if [[ $DRIFT_OUTPUT == "Drift found" ]]; 
+          then
+            echo "Drift detected in ${{ matrix.account_code }}. Creating GitHub issue." 
+            gh issue create --title "⚠️ ${{ matrix.account_code }} - Possible Drift Detected" \
+            --body "Possible drift detected in account **${{ matrix.account_code }}**
+            See Workflow Run: [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}):
+            \`\`\` $(cat tf_changes.json)
+            \`\`\`
+
+            Please review and address this drift." \
+              --label "terraform-drift"
+
+            elif [[ $DRIFT_OUTPUT == *"failed"* ]]; 
+            then
+            echo "Drift detection failed for ${{ matrix.account_code }}. Creating GitHub issue." 
+            gh issue create --title "⚠️ ${{ matrix.account_code }} - Drift Detection Failed" \
+                    --body "Drift Dection failed for account **${{ matrix.account_code }}**:\n\`\`\`\n$DRIFT_OUTPUT\n\`\`\`\nPlease review and address this issue.\n\n : See Workflow Run: [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+                    --label "terraform-failure"
+          else
+           echo "No drift detected for ${{ matrix.account_code }}."
+          fi

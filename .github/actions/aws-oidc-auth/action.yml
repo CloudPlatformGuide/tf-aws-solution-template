@@ -1,0 +1,22 @@
+name: "Configure AWS OIDC"
+description: "Configures AWS credentials using OIDC"
+inputs:
+  account_id:
+    description: "AWS Account ID"
+    required: true
+  region:
+    description: "AWS Region"
+    required: true
+    default: "us-east-1"
+  role_name:
+    description: "Role Name"
+    required: true
+    default: RRMS-Cloud-MGMT
+runs:
+  using: "composite"
+  steps:
+    - name: Configure AWS Credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::${{ inputs.account_id }}:role/${{ inputs.role_name }}
+        aws-region: ${{ inputs.region }}

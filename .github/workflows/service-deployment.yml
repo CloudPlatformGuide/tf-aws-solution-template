@@ -1,0 +1,179 @@
+name: "Terraform Deploy Service"
+permissions:
+  id-token: write
+  contents: read
+on:
+  workflow_dispatch:
+    inputs:
+      account_code:
+        description: "Customer Account Code"
+        required: true
+        type: string
+      region:
+        description: "AWS Region to deploy services"
+        type: string
+        default: "us-east-1"
+      apply_changes:
+        description: "Deploy changes?"
+        required: true
+        type: choice
+        options:
+          - "yes"
+          - "no"
+      destroy_resources:
+        description: "Delete resources?"
+        required: true
+        type: choice
+        options:
+          - "no"
+          - "yes"
+      tf_version:
+        description: "Terraform Version"
+        required: true
+        default: "1.5.7"
+env:
+  ACCOUNT_ID: ${{ secrets[inputs.account_code] }}
+  AWS_ROLE_NAME: ${{ secrets['AWS_ROLE_NAME']}}
+  REGION: ${{ github.event.inputs.region }}
+  TF_VERSION: ${{ github.event.inputs.tf_version }}
+
+jobs:
+  create_state:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+      - name: Configure AWS Credentials (OIDC)
+        uses: ./.github/actions/aws-oidc-auth
+        with:
+          account_id: ${{ env.ACCOUNT_ID }}
+          region: ${{ env.REGION }}
+          role_name: ${{ env.AWS_ROLE_NAME }}
+      - name: Make TF State Script Executable
+        run: chmod +x .github/workflows/scripts/terraform-state.sh
+      - name: Create TF State
+        run: ./.github/workflows/scripts/terraform-state.sh terraform::create_state true "tf-state-mgmt" "tf-state-mgmt" ${{ env.REGION }} "${{ env.AWS_ROLE_NAME }}" | tee /dev/stderr
+      - name: Upload TF Backend file
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-config
+          path: state.config
+  prepare_modules:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+      - name: Download S3 Terraform Modules
+        uses: ./.github/actions/download-modules
+        with:
+          s3-bucket: "tf-aws-rrm-modules"
+          aws-role-arn: "arn:aws:iam::${{ secrets.AWS_MODULE_ACCOUNT_ID }}:role/AWS-TF-GITHUB-ROLE"
+          aws-region: "us-east-1"
+          destination-dir: "terraform_modules"
+  plan:
+    needs:
+      - create_state
+      - prepare_modules
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+      - name: Get TF Backend File
+        uses: actions/download-artifact@v4
+        with:
+          name: state-config
+      - name: Display file contents
+        run: cat state.config
+      - name: Download Terraform modules artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-modules
+          path: remote_modules
+      - name: Configure AWS Credentials (OIDC)
+        uses: ./.github/actions/aws-oidc-auth
+        with:
+          account_id: ${{ env.ACCOUNT_ID }}
+          region: ${{ env.REGION }}
+          role_name: $${{ env.AWS_ROLE_NAME }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Terraform Init
+        run: |
+
+          terraform init -backend-config="state.config"
+      - name: Terraform Plan
+        run: |
+          terraform plan -var-file="./environments/$(echo ${{ inputs.account_code }} | tr '[:upper:]' '[:lower:]').tfvars"
+  apply:
+    needs:
+      - create_state
+      - plan
+    runs-on: ubuntu-latest
+    if: github.event.inputs.apply_changes == 'yes'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+      - name: Get TF Backend File
+        uses: actions/download-artifact@v4
+        with:
+          name: state-config
+      - name: Download Terraform modules artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-modules
+          path: remote_modules
+      - name: Configure AWS Credentials (OIDC)
+        uses: ./.github/actions/aws-oidc-auth
+        with:
+          account_id: ${{ env.ACCOUNT_ID }}
+          region: ${{ env.REGION }}
+          role_name: ${{ env.AWS_ROLE_NAME }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Terraform Init
+        run: |
+          terraform init -backend-config="state.config"
+      - name: Terraform Apply
+        run: |
+          terraform apply -var-file="./environments/$(echo ${{ inputs.account_code }} | tr '[:upper:]' '[:lower:]').tfvars" -auto-approve
+  destroy:
+    needs:
+      - create_state
+      - plan
+    runs-on: ubuntu-latest
+    if: github.event.inputs.destroy_resources == 'yes'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+      - name: Get TF Backend File
+        uses: actions/download-artifact@v4
+        with:
+          name: state-config
+      - name: Download Terraform modules artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-modules
+          path: remote_modules
+      - name: Configure AWS Credentials (OIDC)
+        uses: ./.github/actions/aws-oidc-auth
+        with:
+          account_id: ${{ env.ACCOUNT_ID }}
+          region: ${{ env.REGION }}
+          role_name: ${{ env.AWS_ROLE_NAME }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Terraform Init
+        run: |
+          terraform init -backend-config="state.config"
+      - name: Terraform Destroy
+        run: |
+          terraform destroy -var-file="./environments/$(echo ${{ inputs.account_code }} | tr '[:upper:]' '[:lower:]').tfvars" -auto-approve
